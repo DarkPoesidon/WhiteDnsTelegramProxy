@@ -185,7 +185,7 @@ var (
 
 // DNS over HTTPS (DoH) Cache and Clients
 type dohCacheEntry struct {
-	ip  string
+	ips []string
 	exp time.Time
 }
 
@@ -430,6 +430,25 @@ func cachedAdaptiveCfIP(domain string) string {
 		return ""
 	}
 	return entry.ip
+}
+
+func clearNetworkCaches() {
+	dohCache.Range(func(key, _ any) bool {
+		dohCache.Delete(key)
+		return true
+	})
+	dohClient.CloseIdleConnections()
+
+	cfAdaptiveMu.Lock()
+	cfAdaptiveIPByDomain = make(map[string]cfAdaptiveCacheEntry)
+	cfAdaptiveFailedUntil = make(map[string]time.Time)
+	cfAdaptiveLastScan = make(map[string]time.Time)
+	cfAdaptiveMu.Unlock()
+
+	clearCfproxyFailureCooldowns()
+	if logInfo != nil {
+		logInfo.Printf(" Network changed: route caches cleared")
+	}
 }
 
 func saveAdaptiveCfIP(domain, ip string) {
@@ -1179,47 +1198,53 @@ func pickPreferredIP(candidates []string) string {
 	return fallbackV6
 }
 
-func resolveDoH(ctx context.Context, domain string) string {
+func appendUniqueIPs(dst []string, candidates ...string) []string {
+	seen := make(map[string]struct{}, len(dst)+len(candidates))
+	for _, candidate := range dst {
+		seen[candidate] = struct{}{}
+	}
+	for _, candidate := range candidates {
+		ip := net.ParseIP(strings.TrimSpace(candidate))
+		if ip == nil {
+			continue
+		}
+		normalized := ip.String()
+		if _, exists := seen[normalized]; exists {
+			continue
+		}
+		seen[normalized] = struct{}{}
+		dst = append(dst, normalized)
+	}
+	return dst
+}
+
+func resolveDoHCandidates(ctx context.Context, domain string) []string {
 	if val, ok := dohCache.Load(domain); ok {
 		entry := val.(dohCacheEntry)
 		if time.Now().Before(entry.exp) {
-			return entry.ip
+			return append([]string(nil), entry.ips...)
 		}
+		dohCache.Delete(domain)
 	}
 
-	resCh := make(chan string, 10)
+	resCh := make(chan []string, 2)
 	dnsCtx, cancel := context.WithTimeout(ctx, 1500*time.Millisecond)
 	defer cancel()
-
-	udpServers := []string{"1.1.1.1:53", "8.8.8.8:53", "77.88.8.8:53"}
-	for _, srv := range udpServers {
-		go func(s string) {
-			r := &net.Resolver{
-				PreferGo: true,
-				Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-					d := net.Dialer{Timeout: 800 * time.Millisecond}
-					return d.DialContext(ctx, "udp", s)
-				},
-			}
-			ips, err := r.LookupHost(dnsCtx, domain)
-			if preferred := pickPreferredIP(ips); err == nil && preferred != "" {
-				select {
-				case resCh <- preferred:
-				default:
-				}
-			}
-		}(srv)
-	}
 
 	endpoints := []string{
 		"https://cloudflare-dns.com/dns-query",
 		"https://dns.google/dns-query",
-		"https://dns.quad9.net/dns-query",
-		"https://dns.adguard-dns.com/dns-query",
 	}
 
 	for _, url := range endpoints {
 		go func(u string) {
+			var ips []string
+			defer func() {
+				select {
+				case resCh <- ips:
+				case <-dnsCtx.Done():
+				}
+			}()
 			fullURL := fmt.Sprintf("%s?name=%s&type=A", u, domain)
 			req, err := http.NewRequestWithContext(dnsCtx, "GET", fullURL, nil)
 			if err != nil {
@@ -1238,25 +1263,34 @@ func resolveDoH(ctx context.Context, domain string) string {
 			if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
 				return
 			}
+			ips = make([]string, 0, len(r.Answer))
 			for _, ans := range r.Answer {
 				if ans.Type == 1 {
-					select {
-					case resCh <- ans.Data:
-					default:
-					}
-					return
+					ips = appendUniqueIPs(ips, ans.Data)
 				}
 			}
 		}(url)
 	}
 
-	select {
-	case ip := <-resCh:
-		dohCache.Store(domain, dohCacheEntry{ip: ip, exp: time.Now().Add(5 * time.Minute)})
-		return ip
-	case <-dnsCtx.Done():
-		return ""
+	var candidates []string
+	for completed := 0; completed < len(endpoints); {
+		select {
+		case ips := <-resCh:
+			completed++
+			candidates = appendUniqueIPs(candidates, ips...)
+		case <-dnsCtx.Done():
+			completed = len(endpoints)
+		}
 	}
+	if len(candidates) > 0 {
+		dohCache.Store(domain, dohCacheEntry{ips: append([]string(nil), candidates...), exp: time.Now().Add(5 * time.Minute)})
+	}
+	return candidates
+}
+
+func resolveDoH(ctx context.Context, domain string) string {
+	candidates := resolveDoHCandidates(ctx, domain)
+	return pickPreferredIP(candidates)
 }
 
 func wsConnectTimeout(timeout float64) time.Duration {
@@ -1477,8 +1511,8 @@ func scanAdaptiveCfDomain(ctx context.Context, domain, path, excludeIP string) (
 	select {
 	case cfAdaptiveScanSem <- struct{}{}:
 		defer func() { <-cfAdaptiveScanSem }()
-	case <-ctx.Done():
-		return nil, "", ctx.Err()
+	default:
+		return nil, "", fmt.Errorf("adaptive scan already running")
 	}
 
 	if ws, ip := tryCachedAdaptiveCfDomain(ctx, domain, path, cfAdaptiveProbeTimeout); ws != nil {
@@ -1591,23 +1625,34 @@ func cfConnectDomain(ctx context.Context, domain, path string, timeout float64) 
 		return nil, "", hostErr
 	}
 
-	resolvedIP := resolveDoH(ctx, domain)
-	if resolvedIP == "" {
+	resolvedIPs := resolveDoHCandidates(ctx, domain)
+	if len(resolvedIPs) == 0 {
 		logDebug.Printf(" CF DNS %s -> no result", domain)
 		return nil, "", hostErr
 	}
 
-	logDebug.Printf(" CF DNS %s -> %s", domain, resolvedIP)
-	ipCtx, cancelIP, ipTimeout := newTimedAttemptContext(ctx, phaseTimeout)
-	ws, err := wsConnectOnce(ipCtx, resolvedIP, domain, path, ipTimeout)
-	cancelIP()
-	if err == nil {
-		return ws, resolvedIP, nil
+	logDebug.Printf(" CF HTTPS DNS %s -> %s", domain, strings.Join(resolvedIPs, ","))
+	lastIP := ""
+	lastErr := hostErr
+	for _, resolvedIP := range resolvedIPs {
+		if adaptiveCfIPFailed(resolvedIP) {
+			continue
+		}
+		lastIP = resolvedIP
+		ipCtx, cancelIP, ipTimeout := newTimedAttemptContext(ctx, phaseTimeout)
+		ws, err := wsConnectOnce(ipCtx, resolvedIP, domain, path, ipTimeout)
+		cancelIP()
+		if err == nil {
+			saveAdaptiveCfIP(domain, resolvedIP)
+			return ws, resolvedIP, nil
+		}
+		clearAdaptiveCfIP(domain, resolvedIP)
+		lastErr = err
+		if ctx.Err() == nil {
+			logCfConnError(" CF IP fail %s (%s): %s", err, domain, resolvedIP, compactConnError(err))
+		}
 	}
-	if ctx.Err() == nil {
-		logCfConnError(" CF IP fail %s (%s): %s", err, domain, resolvedIP, compactConnError(err))
-	}
-	return nil, resolvedIP, err
+	return nil, lastIP, lastErr
 }
 
 func wsConnect(ctx context.Context, ip, domain, path string, timeout float64) (*RawWebSocket, error) {
@@ -2306,6 +2351,40 @@ func bridgeWS(ctx context.Context, conn net.Conn, ws *RawWebSocket,
 
 	ctx2, cancel := context.WithCancel(ctx)
 	defer cancel()
+	startedAt := time.Now()
+	var upBytes, downBytes, upFrames, downFrames, splitterHighWater atomic.Int64
+	var closeReasonOnce sync.Once
+	var closeReason atomic.Value
+	setCloseReason := func(reason string) {
+		if reason != "" {
+			closeReasonOnce.Do(func() {
+				closeReason.Store(reason)
+			})
+		}
+	}
+	updateSplitterHighWater := func() {
+		if splitter == nil {
+			return
+		}
+		buffered := int64(len(splitter.cipherBuf))
+		for {
+			current := splitterHighWater.Load()
+			if buffered <= current || splitterHighWater.CompareAndSwap(current, buffered) {
+				return
+			}
+		}
+	}
+	defer func() {
+		reason := "bridge_complete"
+		if stored := closeReason.Load(); stored != nil {
+			reason = stored.(string)
+		}
+		logInfo.Printf(
+			" CF bridge closed DC%d%s domain=%s reason=%s duration=%s up=%d down=%d up_frames=%d down_frames=%d splitter_high_water=%d",
+			dc, mediaTag(isMedia), dst, reason, time.Since(startedAt).Round(time.Millisecond),
+			upBytes.Load(), downBytes.Load(), upFrames.Load(), downFrames.Load(), splitterHighWater.Load(),
+		)
+	}()
 
 	go func() {
 		<-ctx2.Done()
@@ -2333,6 +2412,7 @@ func bridgeWS(ctx context.Context, conn net.Conn, ws *RawWebSocket,
 				activityMu.Unlock()
 				if idle > bridgePingInterval {
 					if err := ws.SendPing(); err != nil {
+						setCloseReason("ws_ping_" + compactConnError(err))
 						cancel()
 						return
 					}
@@ -2356,6 +2436,7 @@ func bridgeWS(ctx context.Context, conn net.Conn, ws *RawWebSocket,
 			if n > 0 {
 				chunk := buf[:n]
 				stats.bytesUp.Add(int64(n))
+				upBytes.Add(int64(n))
 
 				activityMu.Lock()
 				lastActivity = time.Now()
@@ -2367,28 +2448,36 @@ func bridgeWS(ctx context.Context, conn net.Conn, ws *RawWebSocket,
 				var sendErr error
 				if splitter != nil {
 					parts := splitter.Split(chunk)
+					updateSplitterHighWater()
+					upFrames.Add(int64(len(parts)))
 					if len(parts) > 1 {
 						sendErr = ws.SendBatch(parts)
 					} else if len(parts) == 1 {
 						sendErr = ws.Send(parts[0])
 					}
 				} else {
+					upFrames.Add(1)
 					sendErr = ws.Send(chunk)
 				}
 				if sendErr != nil {
+					setCloseReason("ws_send_" + compactConnError(sendErr))
 					return
 				}
 			}
 			if err != nil {
+				setCloseReason("client_read_" + compactConnError(err))
 				if splitter != nil {
 					tail := splitter.Flush()
 					if len(tail) > 0 {
+						upFrames.Add(int64(len(tail)))
 						if len(tail) > 1 {
 							if sendErr := ws.SendBatch(tail); sendErr != nil {
+								setCloseReason("ws_flush_" + compactConnError(sendErr))
 								return
 							}
 						} else {
 							if sendErr := ws.Send(tail[0]); sendErr != nil {
+								setCloseReason("ws_flush_" + compactConnError(sendErr))
 								return
 							}
 						}
@@ -2406,10 +2495,17 @@ func bridgeWS(ctx context.Context, conn net.Conn, ws *RawWebSocket,
 			_ = ws.conn.SetReadDeadline(time.Now().Add(bridgeReadTimeout))
 			data, err := ws.Recv()
 			if err != nil || data == nil {
+				if err != nil {
+					setCloseReason("ws_recv_" + compactConnError(err))
+				} else {
+					setCloseReason("ws_recv_empty")
+				}
 				return
 			}
 			n := len(data)
 			stats.bytesDown.Add(int64(n))
+			downBytes.Add(int64(n))
+			downFrames.Add(1)
 
 			activityMu.Lock()
 			lastActivity = time.Now()
@@ -2418,6 +2514,7 @@ func bridgeWS(ctx context.Context, conn net.Conn, ws *RawWebSocket,
 			tgDec.XORKeyStream(data, data)
 			cltEnc.XORKeyStream(data, data)
 			if _, werr := conn.Write(data); werr != nil {
+				setCloseReason("client_write_" + compactConnError(werr))
 				return
 			}
 		}
@@ -2516,6 +2613,16 @@ func tryCfproxyBaseDomain(ctx context.Context, dc int, baseDomain string) (*RawW
 	logDebug.Printf(" CF try %s", domain)
 
 	ws, resolvedIP, err := cfConnectDomain(ctx, domain, "/apiws", 5)
+	if err != nil {
+		if ctx.Err() == nil && !isHTTPStatusError(err, http.StatusTooManyRequests) {
+			if adaptiveWS, adaptiveIP, adaptiveErr := scanAdaptiveCfDomain(ctx, domain, "/apiws", resolvedIP); adaptiveErr == nil {
+				logInfo.Printf(" CF adaptive session route %s via %s", domain, adaptiveIP)
+				ws = adaptiveWS
+				resolvedIP = adaptiveIP
+				err = nil
+			}
+		}
+	}
 	if err != nil {
 		noteCfproxyScore(baseDomain, false, err)
 		markCfproxyFailureCooldown(baseDomain)
@@ -3574,6 +3681,11 @@ func SetCfProxyCacheDir(cCacheDir *C.char) {
 	cfproxyMu.Lock()
 	cfproxyCacheDir = strings.TrimSpace(C.GoString(cCacheDir))
 	cfproxyMu.Unlock()
+}
+
+//export ClearNetworkCaches
+func ClearNetworkCaches() {
+	clearNetworkCaches()
 }
 
 //export SetCfProxyConfig

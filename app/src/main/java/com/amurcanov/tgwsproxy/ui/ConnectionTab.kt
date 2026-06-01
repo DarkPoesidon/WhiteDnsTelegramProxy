@@ -51,7 +51,6 @@ fun ConnectionTab(settingsStore: SettingsStore) {
     val savedPort by settingsStore.port.collectAsStateWithLifecycle(initialValue = "1443")
     val savedRouteProvider by settingsStore.routeProvider.collectAsStateWithLifecycle(initialValue = SettingsStore.ROUTE_SMART)
     val savedCfEnabled by settingsStore.cfproxyEnabled.collectAsStateWithLifecycle(initialValue = true)
-    val savedPoolSize by settingsStore.poolSize.collectAsStateWithLifecycle(initialValue = 4)
     val savedSecretKey by settingsStore.secretKey.collectAsStateWithLifecycle(initialValue = "LOADING")
 
     val scope = rememberCoroutineScope()
@@ -245,7 +244,6 @@ fun ConnectionTab(settingsStore: SettingsStore) {
 
                         ProxyStatusPanel(
                             routeLabel = routeLabel(savedRouteProvider, savedCfEnabled, t),
-                            poolSize = savedPoolSize,
                             port = savedPort,
                             version = currentVersion,
                             routeStatus = routeStatus,
@@ -319,7 +317,6 @@ fun ConnectionTab(settingsStore: SettingsStore) {
 @Composable
 private fun ProxyStatusPanel(
     routeLabel: String,
-    poolSize: Int,
     port: String,
     version: String,
     routeStatus: String,
@@ -352,7 +349,7 @@ private fun ProxyStatusPanel(
                 )
                 ProxyStatusDivider()
                 ProxyStatusItem(
-                    text = "${t.pool} x$poolSize",
+                    text = "TLS WS",
                     modifier = Modifier
                         .weight(1.05f)
                         .padding(horizontal = 6.dp, vertical = 8.dp)
@@ -463,7 +460,7 @@ private fun String.toFriendlyHealthStatus(t: AppStrings): String {
         if (idx <= 0) null else it.substring(0, idx) to it.substring(idx + 1)
     }.toMap()
     return when (parts["state"]) {
-        "starting" -> t.routeTesting
+        "starting", "network_changed" -> t.routeTesting
         "restarting", "repairing" -> t.autoRepairing
         "stopped" -> t.proxyStopped
         else -> toFriendlyProbeStatus(t)

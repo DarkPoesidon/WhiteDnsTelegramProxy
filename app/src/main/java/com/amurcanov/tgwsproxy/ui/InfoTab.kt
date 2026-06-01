@@ -49,7 +49,6 @@ fun InfoTab(settingsStore: SettingsStore) {
     val context = LocalContext.current
     val t = appStrings()
     val savedPort by settingsStore.port.collectAsStateWithLifecycle(initialValue = "1443")
-    val savedPoolSize by settingsStore.poolSize.collectAsStateWithLifecycle(initialValue = 4)
     val savedRouteProvider by settingsStore.routeProvider.collectAsStateWithLifecycle(initialValue = SettingsStore.ROUTE_SMART)
     val savedCfEnabled by settingsStore.cfproxyEnabled.collectAsStateWithLifecycle(initialValue = true)
     val savedCustomCfDomainEnabled by settingsStore.customCfDomainEnabled.collectAsStateWithLifecycle(initialValue = false)
@@ -60,7 +59,6 @@ fun InfoTab(settingsStore: SettingsStore) {
         t = t,
         context = context,
         port = savedPort,
-        poolSize = savedPoolSize,
         routeProvider = savedRouteProvider,
         cfEnabled = savedCfEnabled,
         customCfDomainEnabled = savedCustomCfDomainEnabled,
@@ -167,7 +165,6 @@ private fun buildSupportReport(
     t: AppStrings,
     context: Context,
     port: String,
-    poolSize: Int,
     routeProvider: String,
     cfEnabled: Boolean,
     customCfDomainEnabled: Boolean,
@@ -202,7 +199,6 @@ private fun buildSupportReport(
         appendLine("Network: ${networkType(context)}")
         appendLine("${t.settings}:")
         appendLine("Mode: $mode")
-        appendLine("WS pool: $poolSize")
         append("Port: ${port.trim().ifBlank { "1443" }}")
         append(cfDomainLine)
         appendLine()

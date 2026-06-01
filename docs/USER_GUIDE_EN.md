@@ -19,7 +19,7 @@ It is not a full-device VPN. Other applications do not use this route.
 2. Open WhiteDns TG.
 3. Open `Settings`.
 4. Select `Smart CDN`.
-5. Keep port `1443` and `WS pool` value `2` or `4`.
+5. Keep port `1443`.
 6. Return to `Proxy`.
 7. Tap the large WhiteDns TG logo.
 8. Wait for `Connected`.
@@ -55,7 +55,6 @@ Connects directly to Telegram data-center addresses. Use this to compare routes 
 | --- | --- | --- |
 | Route provider | Chooses Smart CDN, Private front, Google front, or Direct DC | Start with Smart CDN |
 | Port | Local Android proxy port used by Telegram | `1443` |
-| WS pool | Number of prepared WebSocket connections | `2` for lower resource use, `4` for balance |
 | Secret key | Local MTProto proxy key used in the Telegram link | Keep the generated value unless intentionally invalidating an old link |
 | Autostart | Starts the proxy again after device restart | Optional |
 | Validate domain | Tests DNS and the TLS WebSocket handshake for a custom domain | Use before starting Private or Google front |
@@ -239,7 +238,6 @@ Normal user:
 ```text
 Route provider: Smart CDN
 Port: 1443
-WS pool: 2 or 4
 ```
 
 Private operator:
@@ -248,5 +246,4 @@ Private operator:
 Route provider: Private front
 Front base domain: your authorized compatible domain
 Port: 1443
-WS pool: 4
 ```

@@ -8,6 +8,8 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
+import android.net.Network
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
@@ -28,6 +30,7 @@ class ProxyService : Service() {
     private var watchdogJob: Job? = null
     private var healthJob: Job? = null
     private var restartJob: Job? = null
+    private var networkProbeJob: Job? = null
     private var lastNotificationContent: String = ""
     private var lastNotificationAtMs: Long = 0L
     private var notificationStartedAtMs: Long = 0L
@@ -38,6 +41,21 @@ class ProxyService : Service() {
     private var consecutiveRouteFailures = 0
     private var lastAutoRepairAtMs = 0L
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    @Volatile
+    private var defaultNetwork: Network? = null
+    private val networkCallback = object : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: Network) {
+            if (defaultNetwork == network) return
+            defaultNetwork = network
+            onDefaultNetworkChanged()
+        }
+
+        override fun onLost(network: Network) {
+            if (defaultNetwork == network) {
+                defaultNetwork = null
+            }
+        }
+    }
 
     // Saved intent extras for restart on kill / onTaskRemoved
     private var lastPort: Int = 1443
@@ -104,6 +122,35 @@ class ProxyService : Service() {
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
+        registerDefaultNetworkCallback()
+    }
+
+    private fun registerDefaultNetworkCallback() {
+        try {
+            getSystemService(ConnectivityManager::class.java)
+                ?.registerDefaultNetworkCallback(networkCallback)
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not monitor default network changes", e)
+        }
+    }
+
+    private fun onDefaultNetworkChanged() {
+        try {
+            NativeProxy.clearNetworkCaches()
+        } catch (e: Throwable) {
+            Log.w(TAG, "Could not clear native route caches after network change", e)
+        }
+        if (!_isRunning.value || stopInProgress) return
+
+        publishRouteHealth("state=network_changed")
+        networkProbeJob?.cancel()
+        networkProbeJob = serviceScope.launch {
+            delay(1_500)
+            val raw = runRouteProbe()
+            if (raw.isNotBlank()) {
+                publishRouteHealth(raw)
+            }
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -347,6 +394,8 @@ class ProxyService : Service() {
             statsJob = null
             healthJob?.cancel()
             healthJob = null
+            networkProbeJob?.cancel()
+            networkProbeJob = null
 
             try {
                 NativeProxy.rotateCfProxyDomain()
@@ -409,6 +458,8 @@ class ProxyService : Service() {
         statsJob = null
         healthJob?.cancel()
         healthJob = null
+        networkProbeJob?.cancel()
+        networkProbeJob = null
         serviceScope.launch {
             updateNotification("Stopping proxy...", force = true)
             requestNativeStop("stop")
@@ -590,6 +641,14 @@ class ProxyService : Service() {
         statsJob = null
         healthJob?.cancel()
         healthJob = null
+        networkProbeJob?.cancel()
+        networkProbeJob = null
+        try {
+            getSystemService(ConnectivityManager::class.java)
+                ?.unregisterNetworkCallback(networkCallback)
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not unregister default network callback", e)
+        }
         releaseWakeLock()
         if (_isRunning.value) {
             updateRunningState(false)

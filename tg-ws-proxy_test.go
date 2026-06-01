@@ -3,6 +3,7 @@ package main
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestMergeCfproxyDomainsAcceptsWhitespaceSeparatedList(t *testing.T) {
@@ -80,5 +81,35 @@ func TestAdaptiveCfIPCacheExpiresAndClears(t *testing.T) {
 	}
 	if !adaptiveCfIPFailed(ip) {
 		t.Fatal("expected failed IP quarantine")
+	}
+}
+
+func TestAppendUniqueIPsNormalizesAndDeduplicates(t *testing.T) {
+	got := appendUniqueIPs(nil, "104.16.0.1", " 104.16.0.1 ", "invalid", "2606:4700::1")
+	if len(got) != 2 {
+		t.Fatalf("expected two unique IPs, got %d: %v", len(got), got)
+	}
+	if got[0] != "104.16.0.1" || got[1] != "2606:4700::1" {
+		t.Fatalf("unexpected normalized candidates: %v", got)
+	}
+}
+
+func TestClearNetworkCachesClearsAdaptiveAndDoHState(t *testing.T) {
+	domain := "kws2.example.co.uk"
+	ip := "104.16.0.2"
+	dohCache.Store(domain, dohCacheEntry{ips: []string{ip}, exp: time.Now().Add(time.Minute)})
+	saveAdaptiveCfIP(domain, ip)
+	markCfproxyFailureCooldown("example.co.uk")
+
+	clearNetworkCaches()
+
+	if _, ok := dohCache.Load(domain); ok {
+		t.Fatal("expected DoH cache to be cleared")
+	}
+	if got := cachedAdaptiveCfIP(domain); got != "" {
+		t.Fatalf("expected adaptive cache to be cleared, got %s", got)
+	}
+	if remaining := cfproxyFailureCooldownRemaining("example.co.uk"); remaining != 0 {
+		t.Fatalf("expected route failure cooldown to be cleared, got %s", remaining)
 	}
 }

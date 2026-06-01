@@ -13,6 +13,7 @@ interface ProxyLibrary : Library {
     fun StopProxy(): Int
     fun SetPoolSize(size: Int)
     fun SetCfProxyCacheDir(cacheDir: String)
+    fun ClearNetworkCaches()
     fun SetCfProxyConfig(enabled: Int, priority: Int, userDomain: String)
     fun SetFakeTls(enabled: Int, domain: String)
     fun CheckLocalPort(): Int
@@ -39,6 +40,10 @@ object NativeProxy {
 
     fun setCfProxyCacheDir(cacheDir: String) {
         ProxyLibrary.INSTANCE.SetCfProxyCacheDir(cacheDir)
+    }
+
+    fun clearNetworkCaches() {
+        ProxyLibrary.INSTANCE.ClearNetworkCaches()
     }
 
     fun setCfProxyConfig(enabled: Boolean, priority: Boolean, userDomain: String) {

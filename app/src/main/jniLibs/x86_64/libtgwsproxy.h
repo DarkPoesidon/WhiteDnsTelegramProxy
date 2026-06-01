@@ -106,6 +106,7 @@ extern char* ProbeRoute(void);
 extern int RotateCfProxyDomain(void);
 extern void SetPoolSize(int size);
 extern void SetCfProxyCacheDir(char* cCacheDir);
+extern void ClearNetworkCaches(void);
 extern void SetCfProxyConfig(int enabled, int priority, char* cUserDomain);
 extern void SetSecret(char* cSecret);
 extern char* GetStats(void);
