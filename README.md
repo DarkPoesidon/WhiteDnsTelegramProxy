@@ -20,6 +20,13 @@ For complete instructions, settings explanations, custom-domain setup, and troub
 - [English user guide](docs/USER_GUIDE_EN.md)
 - [راهنمای کامل فارسی](GUIDE_FA.md)
 
+Downloadable private-front setup documents for end users:
+
+- [English PDF](docs/share/WhiteDns-TG-Private-Front-Setup-EN.pdf)
+- [English DOCX](docs/share/WhiteDns-TG-Private-Front-Setup-EN.docx)
+- [راهنمای فارسی PDF](docs/share/WhiteDns-TG-Private-Front-Setup-FA.pdf)
+- [راهنمای فارسی DOCX](docs/share/WhiteDns-TG-Private-Front-Setup-FA.docx)
+
 ## Important Custom-Domain Rule
 
 A purchased domain is not automatically a working front domain. Private and Google-front modes require a domain that you own or are authorized to manage, working DNS for `kws1` through `kws5` and `kws203`, TLS, WebSocket support, and a compatible `/apiws` endpoint.
