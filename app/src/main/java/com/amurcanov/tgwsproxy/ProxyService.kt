@@ -340,6 +340,11 @@ class ProxyService : Service() {
             healthJob?.cancel()
             healthJob = null
 
+            try {
+                NativeProxy.rotateCfProxyDomain()
+            } catch (e: Throwable) {
+                Log.w(TAG, "Could not rotate Smart CDN domain before restart", e)
+            }
             requestNativeStop("restart")
             releaseWakeLock()
             updateRunningState(false)

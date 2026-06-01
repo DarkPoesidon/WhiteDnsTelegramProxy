@@ -34,6 +34,7 @@ import (
 	"io"
 	"log"
 	"math"
+	"math/big"
 	"net"
 	"net/http"
 	"os"
@@ -87,6 +88,7 @@ const (
 	cfproxyFallbackParallel = 2
 	cfproxy429Cooldown      = 45 * time.Second
 	cfproxy429MaxCooldown   = 5 * time.Minute
+	cfproxyFailureCooldown  = 20 * time.Second
 	cfproxyGlobalParallel   = 4
 )
 
@@ -122,8 +124,10 @@ var (
 	cfproxyCacheDir         = ""
 	cfproxyMu               sync.RWMutex
 	cfproxy429StateByDomain = make(map[string]cfproxy429State)
+	cfproxyFailureUntil     = make(map[string]time.Time)
 	cfproxyScoreByDomain    = make(map[string]cfproxyScore)
 	cfproxy429Mu            sync.RWMutex
+	cfproxyFailureMu        sync.RWMutex
 	cfproxyScoreMu          sync.RWMutex
 	cfproxyAttemptSem       = make(chan struct{}, cfproxyGlobalParallel)
 )
@@ -307,10 +311,107 @@ func mergeCfproxyDomains(lists ...[]string) []string {
 	return merged
 }
 
+func cryptoRandomIndex(size int) int {
+	if size <= 1 {
+		return 0
+	}
+	n, err := rand.Int(rand.Reader, big.NewInt(int64(size)))
+	if err != nil {
+		return int(time.Now().UnixNano() % int64(size))
+	}
+	return int(n.Int64())
+}
+
+func shuffleCfproxyDomains(domains []string) {
+	for i := len(domains) - 1; i > 0; i-- {
+		j := cryptoRandomIndex(i + 1)
+		domains[i], domains[j] = domains[j], domains[i]
+	}
+}
+
+func chooseFreshCfproxyDomainLocked(exclude string) string {
+	if len(cfproxyDomains) == 0 {
+		activeCfDomain = ""
+		return ""
+	}
+	if cfproxyUserDomain != "" || len(cfproxyDomains) == 1 {
+		activeCfDomain = cfproxyDomains[0]
+		return activeCfDomain
+	}
+
+	exclude = normalizeCfDomain(exclude)
+	candidates := make([]string, 0, len(cfproxyDomains)-1)
+	for _, domain := range cfproxyDomains {
+		if domain != exclude {
+			candidates = append(candidates, domain)
+		}
+	}
+	if len(candidates) == 0 {
+		candidates = append(candidates, cfproxyDomains...)
+	}
+	activeCfDomain = candidates[cryptoRandomIndex(len(candidates))]
+	return activeCfDomain
+}
+
+func rotateCfproxyDomain(exclude string) string {
+	cfproxyMu.Lock()
+	chosen := chooseFreshCfproxyDomainLocked(exclude)
+	cfproxyMu.Unlock()
+	if chosen != "" {
+		saveActiveCfproxyDomain(chosen)
+	}
+	return chosen
+}
+
 func clearCfproxy429Cooldowns() {
 	cfproxy429Mu.Lock()
 	cfproxy429StateByDomain = make(map[string]cfproxy429State)
 	cfproxy429Mu.Unlock()
+}
+
+func clearCfproxyFailureCooldowns() {
+	cfproxyFailureMu.Lock()
+	cfproxyFailureUntil = make(map[string]time.Time)
+	cfproxyFailureMu.Unlock()
+}
+
+func markCfproxyFailureCooldown(domain string) {
+	domain = normalizeCfDomain(domain)
+	if domain == "" {
+		return
+	}
+	cfproxyFailureMu.Lock()
+	cfproxyFailureUntil[domain] = time.Now().Add(cfproxyFailureCooldown)
+	cfproxyFailureMu.Unlock()
+}
+
+func clearCfproxyFailureCooldown(domain string) {
+	domain = normalizeCfDomain(domain)
+	if domain == "" {
+		return
+	}
+	cfproxyFailureMu.Lock()
+	delete(cfproxyFailureUntil, domain)
+	cfproxyFailureMu.Unlock()
+}
+
+func cfproxyFailureCooldownRemaining(domain string) time.Duration {
+	domain = normalizeCfDomain(domain)
+	if domain == "" {
+		return 0
+	}
+	cfproxyFailureMu.RLock()
+	until, ok := cfproxyFailureUntil[domain]
+	cfproxyFailureMu.RUnlock()
+	if !ok {
+		return 0
+	}
+	remaining := time.Until(until)
+	if remaining <= 0 {
+		clearCfproxyFailureCooldown(domain)
+		return 0
+	}
+	return remaining
 }
 
 func noteCfproxyScore(domain string, ok bool, err error) {
@@ -608,7 +709,10 @@ func initCfproxyDomains() {
 	} else {
 		cfproxyDomains = defaults
 	}
-	setActiveCfproxyDomainLocked(persistedActive)
+	chosen := chooseFreshCfproxyDomainLocked(persistedActive)
+	if chosen != "" {
+		logInfo.Printf(" CF: startup domain %s", chosen)
+	}
 }
 
 func startCfproxyRefresh(ctx context.Context) {
@@ -665,8 +769,10 @@ func tryRefreshCfproxyDomains(ctx context.Context) bool {
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		if domain := normalizeCfDomain(line); domain != "" {
-			newDomains = append(newDomains, domain)
+		for _, field := range strings.Fields(line) {
+			if domain := normalizeCfDomain(field); domain != "" {
+				newDomains = append(newDomains, domain)
+			}
 		}
 	}
 	if err := scanner.Err(); err != nil {
@@ -2123,6 +2229,10 @@ func tryCfproxyBaseDomain(ctx context.Context, dc int, baseDomain string) (*RawW
 		logDebug.Printf(" CF skip %s: 429 cooldown %.0fs", baseDomain, math.Ceil(remaining.Seconds()))
 		return nil, ""
 	}
+	if remaining := cfproxyFailureCooldownRemaining(baseDomain); remaining > 0 {
+		logDebug.Printf(" CF skip %s: failure cooldown %.0fs", baseDomain, math.Ceil(remaining.Seconds()))
+		return nil, ""
+	}
 	if !acquireCfproxyAttemptSlot(ctx) {
 		return nil, ""
 	}
@@ -2134,6 +2244,7 @@ func tryCfproxyBaseDomain(ctx context.Context, dc int, baseDomain string) (*RawW
 	ws, resolvedIP, err := cfConnectDomain(ctx, domain, "/apiws", 5)
 	if err != nil {
 		noteCfproxyScore(baseDomain, false, err)
+		markCfproxyFailureCooldown(baseDomain)
 		if ctx.Err() == nil && isHTTPStatusError(err, http.StatusTooManyRequests) {
 			markCfproxy429Cooldown(baseDomain, err)
 		}
@@ -2149,6 +2260,7 @@ func tryCfproxyBaseDomain(ctx context.Context, dc int, baseDomain string) (*RawW
 
 	noteCfproxyScore(baseDomain, true, nil)
 	clearCfproxy429Cooldown(baseDomain)
+	clearCfproxyFailureCooldown(baseDomain)
 	if resolvedIP != "" {
 		logDebug.Printf(" CF ok %s via %s", domain, resolvedIP)
 	} else {
@@ -2172,11 +2284,14 @@ func cfproxyFallback(ctx context.Context, conn net.Conn, relayInit []byte, label
 	cfproxyMu.RUnlock()
 
 	ordered := []string{active}
+	remaining := make([]string, 0, len(domains))
 	for _, d := range domains {
 		if d != active {
-			ordered = append(ordered, d)
+			remaining = append(remaining, d)
 		}
 	}
+	shuffleCfproxyDomains(remaining)
+	ordered = append(ordered, remaining...)
 
 	mTag := mediaTag(isMedia)
 	logDebug.Printf(" CF fallback DC%d%s: %d domain(s)", dc, mTag, len(ordered))
@@ -2249,6 +2364,9 @@ func cfproxyFallback(ctx context.Context, conn net.Conn, relayInit []byte, label
 	}
 
 	if ws == nil {
+		if next := rotateCfproxyDomain(active); next != "" && next != active {
+			logInfo.Printf(" CF: rotating failed domain %s -> %s", active, next)
+		}
 		logWarn.Printf(" CF fallback DC%d%s: all CF domains are unavailable", dc, mTag)
 		return false
 	}
@@ -2922,6 +3040,7 @@ func StartProxy(cHost *C.char, port C.int, cDcIps *C.char, cSecret *C.char, verb
 
 	initLogging(isVerbose)
 	clearCfproxy429Cooldowns()
+	clearCfproxyFailureCooldowns()
 
 	if len(secretStr) == 32 {
 		if _, err := hex.DecodeString(secretStr); err == nil {
@@ -3039,15 +3158,20 @@ func probeCfRoute(ctx context.Context, dc int, baseDomain string) (string, error
 	if baseDomain == "" {
 		return "", fmt.Errorf("empty front domain")
 	}
+	if remaining := cfproxyFailureCooldownRemaining(baseDomain); remaining > 0 {
+		return "", fmt.Errorf("failure cooldown %.0fs", math.Ceil(remaining.Seconds()))
+	}
 
 	domain := fmt.Sprintf("kws%d.%s", dc, baseDomain)
 	ws, _, err := cfConnectDomain(ctx, domain, "/apiws", 5)
 	if err != nil {
 		noteCfproxyScore(baseDomain, false, err)
+		markCfproxyFailureCooldown(baseDomain)
 		return "", err
 	}
 	noteCfproxyScore(baseDomain, true, nil)
 	clearCfproxy429Cooldown(baseDomain)
+	clearCfproxyFailureCooldown(baseDomain)
 	ws.Close()
 	return baseDomain, nil
 }
@@ -3097,11 +3221,14 @@ func ProbeRoute() *C.char {
 		if active != "" {
 			ordered = append(ordered, active)
 		}
+		remaining := make([]string, 0, len(domains))
 		for _, domain := range domains {
 			if domain != "" && domain != active {
-				ordered = append(ordered, domain)
+				remaining = append(remaining, domain)
 			}
 		}
+		shuffleCfproxyDomains(remaining)
+		ordered = append(ordered, remaining...)
 		for _, baseDomain := range ordered {
 			chosen, err := probeCfRoute(ctx, 2, baseDomain)
 			if err == nil {
@@ -3125,9 +3252,22 @@ func ProbeRoute() *C.char {
 	}
 
 	if cfOn {
+		rotateCfproxyDomain(active)
 		return C.CString(fmt.Sprintf("ok=0 stage=cf active=%s domains=%d err=front_and_tcp_failed", active, len(domains)))
 	}
 	return C.CString(fmt.Sprintf("ok=0 stage=tcp active=%s err=tcp_failed", tcpTarget))
+}
+
+//export RotateCfProxyDomain
+func RotateCfProxyDomain() C.int {
+	cfproxyMu.RLock()
+	active := activeCfDomain
+	cfproxyMu.RUnlock()
+	if next := rotateCfproxyDomain(active); next != "" && next != active {
+		logInfo.Printf(" CF: manual rotation %s -> %s", active, next)
+		return 1
+	}
+	return 0
 }
 
 //export SetPoolSize

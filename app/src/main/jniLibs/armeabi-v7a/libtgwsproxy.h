@@ -103,6 +103,7 @@ extern int StopProxy(void);
 extern int CheckLocalPort(void);
 extern char* ValidateFrontDomain(char* cDomain);
 extern char* ProbeRoute(void);
+extern int RotateCfProxyDomain(void);
 extern void SetPoolSize(int size);
 extern void SetCfProxyCacheDir(char* cCacheDir);
 extern void SetCfProxyConfig(int enabled, int priority, char* cUserDomain);

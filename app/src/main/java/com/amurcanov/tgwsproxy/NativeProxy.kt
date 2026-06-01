@@ -18,6 +18,7 @@ interface ProxyLibrary : Library {
     fun CheckLocalPort(): Int
     fun ProbeRoute(): Pointer?
     fun ValidateFrontDomain(domain: String): Pointer?
+    fun RotateCfProxyDomain(): Int
     fun GetSecretWithPrefix(): Pointer?
     fun GetStats(): Pointer?
     fun FreeString(p: Pointer)
@@ -68,6 +69,10 @@ object NativeProxy {
         val res = ptr.getString(0)
         ProxyLibrary.INSTANCE.FreeString(ptr)
         return res
+    }
+
+    fun rotateCfProxyDomain(): Boolean {
+        return ProxyLibrary.INSTANCE.RotateCfProxyDomain() == 1
     }
 
     /** Returns the full secret with correct prefix (dd or ee+domain_hex) */
