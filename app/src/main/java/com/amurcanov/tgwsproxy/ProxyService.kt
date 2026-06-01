@@ -16,6 +16,8 @@ import androidx.core.app.NotificationCompat
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.net.InetSocketAddress
 import java.net.Socket
 
@@ -82,9 +84,20 @@ class ProxyService : Service() {
         val isRunning: StateFlow<Boolean> = _isRunning
         private val _routeHealth = MutableStateFlow("state=stopped")
         val routeHealth: StateFlow<String> = _routeHealth
+        private val routeProbeMutex = Mutex()
 
         fun publishRouteHealth(raw: String) {
             _routeHealth.value = raw
+        }
+
+        suspend fun runRouteProbe(): String = routeProbeMutex.withLock {
+            withContext(Dispatchers.IO) {
+                try {
+                    NativeProxy.probeRoute().orEmpty()
+                } catch (_: Throwable) {
+                    "ok=0 stage=probe err=native_probe_failed"
+                }
+            }
         }
     }
 
@@ -252,12 +265,7 @@ class ProxyService : Service() {
         healthJob = serviceScope.launch {
             delay(HEALTH_INITIAL_DELAY_MS)
             while (isActive && _isRunning.value && !stopInProgress) {
-                val raw = try {
-                    NativeProxy.probeRoute().orEmpty()
-                } catch (e: Throwable) {
-                    Log.w(TAG, "Route health probe failed", e)
-                    "ok=0 stage=probe err=native_probe_failed"
-                }
+                val raw = runRouteProbe()
                 if (raw.isNotBlank()) {
                     publishRouteHealth(raw)
                 }

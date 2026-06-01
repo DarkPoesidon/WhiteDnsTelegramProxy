@@ -30,7 +30,7 @@ Do not enter `google.com`, `youtube.com`, or unrelated third-party hostnames. Wh
 
 - Local Telegram MTProto proxy on `127.0.0.1:1443`.
 - One-tap Telegram proxy link.
-- Smart CDN routing with WebSocket/TLS and direct fallback.
+- Smart CDN routing with WebSocket/TLS, bounded adaptive Cloudflare IP selection, and direct fallback.
 - Private front mode for user-controlled compatible domains.
 - Experimental Google-front mode for authorized Google-backed compatible domains.
 - Direct Telegram DC mode for comparison and fallback testing.
@@ -46,6 +46,8 @@ Telegram -> 127.0.0.1:1443 -> WhiteDns TG native Go core
 ```
 
 `Connected` means the local Android proxy process is running. It does not prove the internet route is usable. Press `Check` and wait for `Route works` before applying the link in Telegram.
+
+When a Smart CDN hostname resolves but the selected Cloudflare edge times out, `Check` can test a small bounded sample of official Cloudflare IPv4 ranges. The app keeps a verified working edge for 10 minutes, quarantines failed candidates briefly, and rate-limits scans. It does not scan the full Cloudflare network.
 
 ## Build From Source
 

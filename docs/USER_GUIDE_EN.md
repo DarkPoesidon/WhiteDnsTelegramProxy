@@ -35,6 +35,8 @@ It is not a full-device VPN. Other applications do not use this route.
 
 Recommended for most users. The app rotates through its built-in WebSocket front list and can fall back to direct Telegram data centers. No personal domain is required.
 
+If DNS resolves a Smart CDN hostname but that Cloudflare edge times out, `Check` automatically tests a small bounded set of official Cloudflare IPv4 candidates. A working candidate is cached temporarily. Failed candidates are quarantined briefly and scans are rate-limited to protect battery and avoid unnecessary traffic. This is automatic; users do not need to enter Cloudflare IP addresses.
+
 ### Private Front
 
 For operators who control a compatible domain. This can be more stable than shared public fronts because the operator controls the DNS and can rotate domains when needed.

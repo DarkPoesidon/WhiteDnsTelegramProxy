@@ -52,3 +52,33 @@ func TestFailureCooldownSuppressesImmediateRetry(t *testing.T) {
 		t.Fatalf("expected cleared failure cooldown, got %s", remaining)
 	}
 }
+
+func TestAdaptiveCfCandidatesAreBoundedUniqueIPv4(t *testing.T) {
+	candidates := adaptiveCfCandidates()
+	if len(candidates) != cfAdaptiveSampleSize {
+		t.Fatalf("expected %d candidates, got %d", cfAdaptiveSampleSize, len(candidates))
+	}
+	seen := make(map[string]struct{})
+	for _, candidate := range candidates {
+		if _, ok := seen[candidate]; ok {
+			t.Fatalf("duplicate candidate: %s", candidate)
+		}
+		seen[candidate] = struct{}{}
+	}
+}
+
+func TestAdaptiveCfIPCacheExpiresAndClears(t *testing.T) {
+	domain := "kws2.example.co.uk"
+	ip := "104.16.0.1"
+	saveAdaptiveCfIP(domain, ip)
+	if got := cachedAdaptiveCfIP(domain); got != ip {
+		t.Fatalf("expected cached IP %s, got %s", ip, got)
+	}
+	clearAdaptiveCfIP(domain, ip)
+	if got := cachedAdaptiveCfIP(domain); got != "" {
+		t.Fatalf("expected cleared cache, got %s", got)
+	}
+	if !adaptiveCfIPFailed(ip) {
+		t.Fatal("expected failed IP quarantine")
+	}
+}

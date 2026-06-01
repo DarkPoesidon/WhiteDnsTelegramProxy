@@ -445,12 +445,12 @@ private fun canConnectLocal(host: String, port: Int): Boolean {
     }
 }
 
-private fun probeRoute(isRunning: Boolean): String {
+private suspend fun probeRoute(isRunning: Boolean): String {
     if (!isRunning) {
         return "state=stopped"
     }
     return try {
-        NativeProxy.probeRoute().orEmpty()
+        ProxyService.runRouteProbe()
     } catch (_: Throwable) {
         "ok=0 stage=probe err=native_probe_failed"
     }

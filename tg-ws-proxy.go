@@ -90,6 +90,13 @@ const (
 	cfproxy429MaxCooldown   = 5 * time.Minute
 	cfproxyFailureCooldown  = 20 * time.Second
 	cfproxyGlobalParallel   = 4
+	cfAdaptiveSampleSize    = 8
+	cfAdaptiveParallel      = 2
+	cfAdaptiveProbeTimeout  = 1800 * time.Millisecond
+	cfAdaptiveScanTimeout   = 6 * time.Second
+	cfAdaptiveScanCooldown  = 2 * time.Minute
+	cfAdaptiveCacheTTL      = 10 * time.Minute
+	cfAdaptiveFailureTTL    = 2 * time.Minute
 )
 
 var (
@@ -111,6 +118,11 @@ type cfproxyScore struct {
 	lastAt  time.Time
 }
 
+type cfAdaptiveCacheEntry struct {
+	ip  string
+	exp time.Time
+}
+
 func init() {
 	poolSize.Store(defaultPoolSz)
 }
@@ -130,9 +142,33 @@ var (
 	cfproxyFailureMu        sync.RWMutex
 	cfproxyScoreMu          sync.RWMutex
 	cfproxyAttemptSem       = make(chan struct{}, cfproxyGlobalParallel)
+	cfAdaptiveScanSem       = make(chan struct{}, 1)
+	cfAdaptiveMu            sync.RWMutex
+	cfAdaptiveIPByDomain    = make(map[string]cfAdaptiveCacheEntry)
+	cfAdaptiveFailedUntil   = make(map[string]time.Time)
+	cfAdaptiveLastScan      = make(map[string]time.Time)
 )
 
 const cfproxyDomainsURL = "https://raw.githubusercontent.com/DarkPoesidon/WhiteDnsTelegramProxy/main/.github/cfproxy-domains.txt"
+
+// Snapshot of https://api.cloudflare.com/client/v4/ips verified on 2026-06-01.
+var cloudflareIPv4CIDRs = []string{
+	"173.245.48.0/20",
+	"103.21.244.0/22",
+	"103.22.200.0/22",
+	"103.31.4.0/22",
+	"141.101.64.0/18",
+	"108.162.192.0/18",
+	"190.93.240.0/20",
+	"188.114.96.0/20",
+	"197.234.240.0/22",
+	"198.41.128.0/17",
+	"162.158.0.0/15",
+	"104.16.0.0/13",
+	"104.24.0.0/14",
+	"172.64.0.0/13",
+	"131.0.72.0/22",
+}
 
 // MTProto proxy secret (hex, 32 chars = 16 bytes)
 var (
@@ -327,6 +363,110 @@ func shuffleCfproxyDomains(domains []string) {
 		j := cryptoRandomIndex(i + 1)
 		domains[i], domains[j] = domains[j], domains[i]
 	}
+}
+
+func randomIPv4FromCIDR(cidr string) string {
+	ip, network, err := net.ParseCIDR(cidr)
+	if err != nil {
+		return ""
+	}
+	ip4 := ip.To4()
+	if ip4 == nil {
+		return ""
+	}
+	ones, bits := network.Mask.Size()
+	if bits != 32 || ones >= 31 {
+		return ""
+	}
+	hostCount := int64(1) << uint(32-ones)
+	offset, err := rand.Int(rand.Reader, big.NewInt(hostCount-2))
+	if err != nil {
+		return ""
+	}
+	base := int64(binary.BigEndian.Uint32(ip4))
+	value := uint32(base + 1 + offset.Int64())
+	result := make(net.IP, net.IPv4len)
+	binary.BigEndian.PutUint32(result, value)
+	return result.String()
+}
+
+func adaptiveCfCandidates(exclude ...string) []string {
+	seen := make(map[string]struct{})
+	for _, ip := range exclude {
+		if parsed := net.ParseIP(strings.TrimSpace(ip)); parsed != nil {
+			seen[parsed.String()] = struct{}{}
+		}
+	}
+
+	cidrs := append([]string(nil), cloudflareIPv4CIDRs...)
+	shuffleCfproxyDomains(cidrs)
+	candidates := make([]string, 0, cfAdaptiveSampleSize)
+	for attempts := 0; len(candidates) < cfAdaptiveSampleSize && attempts < cfAdaptiveSampleSize*4; attempts++ {
+		cidr := cidrs[attempts%len(cidrs)]
+		ip := randomIPv4FromCIDR(cidr)
+		if ip == "" {
+			continue
+		}
+		if _, exists := seen[ip]; exists {
+			continue
+		}
+		seen[ip] = struct{}{}
+		candidates = append(candidates, ip)
+	}
+	return candidates
+}
+
+func cachedAdaptiveCfIP(domain string) string {
+	cfAdaptiveMu.RLock()
+	entry, ok := cfAdaptiveIPByDomain[domain]
+	cfAdaptiveMu.RUnlock()
+	if !ok {
+		return ""
+	}
+	if time.Now().After(entry.exp) {
+		cfAdaptiveMu.Lock()
+		delete(cfAdaptiveIPByDomain, domain)
+		cfAdaptiveMu.Unlock()
+		return ""
+	}
+	return entry.ip
+}
+
+func saveAdaptiveCfIP(domain, ip string) {
+	if net.ParseIP(ip) == nil {
+		return
+	}
+	cfAdaptiveMu.Lock()
+	cfAdaptiveIPByDomain[domain] = cfAdaptiveCacheEntry{ip: ip, exp: time.Now().Add(cfAdaptiveCacheTTL)}
+	delete(cfAdaptiveFailedUntil, ip)
+	cfAdaptiveMu.Unlock()
+}
+
+func clearAdaptiveCfIP(domain, ip string) {
+	cfAdaptiveMu.Lock()
+	if entry, ok := cfAdaptiveIPByDomain[domain]; ok && entry.ip == ip {
+		delete(cfAdaptiveIPByDomain, domain)
+	}
+	if net.ParseIP(ip) != nil {
+		cfAdaptiveFailedUntil[ip] = time.Now().Add(cfAdaptiveFailureTTL)
+	}
+	cfAdaptiveMu.Unlock()
+}
+
+func adaptiveCfIPFailed(ip string) bool {
+	cfAdaptiveMu.RLock()
+	until, ok := cfAdaptiveFailedUntil[ip]
+	cfAdaptiveMu.RUnlock()
+	if !ok {
+		return false
+	}
+	if time.Now().Before(until) {
+		return true
+	}
+	cfAdaptiveMu.Lock()
+	delete(cfAdaptiveFailedUntil, ip)
+	cfAdaptiveMu.Unlock()
+	return false
 }
 
 func chooseFreshCfproxyDomainLocked(exclude string) string {
@@ -984,6 +1124,19 @@ type WsHandshakeError struct {
 	Location   string
 }
 
+type routePhaseError struct {
+	phase string
+	err   error
+}
+
+func (e *routePhaseError) Error() string {
+	return fmt.Sprintf("%s: %s", e.phase, e.err)
+}
+
+func (e *routePhaseError) Unwrap() error {
+	return e.err
+}
+
 func (e *WsHandshakeError) Error() string {
 	return fmt.Sprintf("HTTP %d: %s", e.StatusCode, e.StatusLine)
 }
@@ -1152,6 +1305,17 @@ func compactConnError(err error) string {
 	if err == nil {
 		return ""
 	}
+	var phaseErr *routePhaseError
+	if errors.As(err, &phaseErr) {
+		if errors.Is(phaseErr.err, context.DeadlineExceeded) {
+			return phaseErr.phase + "_timeout"
+		}
+		var netErr net.Error
+		if errors.As(phaseErr.err, &netErr) && netErr.Timeout() {
+			return phaseErr.phase + "_timeout"
+		}
+		return phaseErr.phase + "_" + strings.ReplaceAll(phaseErr.err.Error(), " ", "_")
+	}
 	if errors.Is(err, context.Canceled) {
 		return "canceled"
 	}
@@ -1193,12 +1357,11 @@ func wsConnectOnce(ctx context.Context, dialAddr, domain, path string, timeout t
 
 	tlsCfg := tlsConfigPool.Clone()
 	tlsCfg.ServerName = domain
-	tlsCfg.InsecureSkipVerify = true
 
 	targetAddr := net.JoinHostPort(dialAddr, "443")
 	rawConn, err := dialer.DialContext(ctx, "tcp", targetAddr)
 	if err != nil {
-		return nil, err
+		return nil, &routePhaseError{phase: "tcp", err: err}
 	}
 
 	setSockOpts(rawConn)
@@ -1212,7 +1375,7 @@ func wsConnectOnce(ctx context.Context, dialAddr, domain, path string, timeout t
 	if err := tlsConn.HandshakeContext(handshakeCtx); err != nil {
 		rawConn.Close()
 		logDebug.Printf(" ws tls fail %s via %s: %s", domain, dialAddr, compactConnError(err))
-		return nil, err
+		return nil, &routePhaseError{phase: "tls", err: err}
 	}
 	_ = tlsConn.SetDeadline(time.Time{})
 	rawConn = tlsConn
@@ -1237,7 +1400,7 @@ func wsConnectOnce(ctx context.Context, dialAddr, domain, path string, timeout t
 	_ = rawConn.SetWriteDeadline(time.Now().Add(timeout))
 	if _, err = rawConn.Write([]byte(req)); err != nil {
 		rawConn.Close()
-		return nil, err
+		return nil, &routePhaseError{phase: "websocket_write", err: err}
 	}
 	_ = rawConn.SetWriteDeadline(time.Time{})
 
@@ -1249,7 +1412,7 @@ func wsConnectOnce(ctx context.Context, dialAddr, domain, path string, timeout t
 		line, err := bufReader.ReadString('\n')
 		if err != nil {
 			rawConn.Close()
-			return nil, err
+			return nil, &routePhaseError{phase: "websocket_read", err: err}
 		}
 		line = strings.TrimRight(line, "\r\n")
 		if line == "" {
@@ -1293,6 +1456,113 @@ func wsConnectOnce(ctx context.Context, dialAddr, domain, path string, timeout t
 	}
 }
 
+func tryCachedAdaptiveCfDomain(ctx context.Context, domain, path string, timeout time.Duration) (*RawWebSocket, string) {
+	ip := cachedAdaptiveCfIP(domain)
+	if ip == "" || adaptiveCfIPFailed(ip) {
+		return nil, ""
+	}
+	attemptCtx, cancel, effectiveTimeout := newTimedAttemptContext(ctx, timeout)
+	defer cancel()
+	ws, err := wsConnectOnce(attemptCtx, ip, domain, path, effectiveTimeout)
+	if err != nil {
+		clearAdaptiveCfIP(domain, ip)
+		logDebug.Printf(" CF adaptive cached IP fail %s (%s): %s", domain, ip, compactConnError(err))
+		return nil, ""
+	}
+	logInfo.Printf(" CF adaptive cached IP %s -> %s", domain, ip)
+	return ws, ip
+}
+
+func scanAdaptiveCfDomain(ctx context.Context, domain, path, excludeIP string) (*RawWebSocket, string, error) {
+	select {
+	case cfAdaptiveScanSem <- struct{}{}:
+		defer func() { <-cfAdaptiveScanSem }()
+	case <-ctx.Done():
+		return nil, "", ctx.Err()
+	}
+
+	if ws, ip := tryCachedAdaptiveCfDomain(ctx, domain, path, cfAdaptiveProbeTimeout); ws != nil {
+		return ws, ip, nil
+	}
+
+	now := time.Now()
+	cfAdaptiveMu.Lock()
+	lastScan := cfAdaptiveLastScan[domain]
+	if now.Sub(lastScan) < cfAdaptiveScanCooldown {
+		cfAdaptiveMu.Unlock()
+		return nil, "", fmt.Errorf("adaptive scan cooldown")
+	}
+	cfAdaptiveLastScan[domain] = now
+	cfAdaptiveMu.Unlock()
+
+	scanCtx, cancelScan := context.WithTimeout(ctx, cfAdaptiveScanTimeout)
+	defer cancelScan()
+
+	candidates := adaptiveCfCandidates(excludeIP)
+	type result struct {
+		ws  *RawWebSocket
+		ip  string
+		err error
+	}
+	results := make(chan result, len(candidates))
+	sem := make(chan struct{}, cfAdaptiveParallel)
+	launched := 0
+	for _, candidate := range candidates {
+		if adaptiveCfIPFailed(candidate) {
+			continue
+		}
+		launched++
+		go func(ip string) {
+			select {
+			case sem <- struct{}{}:
+			case <-scanCtx.Done():
+				results <- result{ip: ip, err: scanCtx.Err()}
+				return
+			}
+			defer func() { <-sem }()
+			attemptCtx, cancel, timeout := newTimedAttemptContext(scanCtx, cfAdaptiveProbeTimeout)
+			defer cancel()
+			ws, err := wsConnectOnce(attemptCtx, ip, domain, path, timeout)
+			results <- result{ws: ws, ip: ip, err: err}
+		}(candidate)
+	}
+
+	var lastErr error
+	for completed := 0; completed < launched; completed++ {
+		select {
+		case r := <-results:
+			if r.ws != nil {
+				saveAdaptiveCfIP(domain, r.ip)
+				logInfo.Printf(" CF adaptive IP selected %s -> %s", domain, r.ip)
+				cancelScan()
+				go func(remaining int) {
+					for ; remaining > 0; remaining-- {
+						if extra := <-results; extra.ws != nil {
+							extra.ws.Close()
+						}
+					}
+				}(launched - completed - 1)
+				return r.ws, r.ip, nil
+			}
+			if r.ip != "" {
+				clearAdaptiveCfIP(domain, r.ip)
+			}
+			if r.err != nil {
+				lastErr = r.err
+			}
+		case <-scanCtx.Done():
+			if lastErr == nil {
+				lastErr = scanCtx.Err()
+			}
+			return nil, "", lastErr
+		}
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no adaptive candidates")
+	}
+	return nil, "", lastErr
+}
+
 func cfConnectDomain(ctx context.Context, domain, path string, timeout float64) (*RawWebSocket, string, error) {
 	if path == "" {
 		path = "/apiws"
@@ -1302,6 +1572,10 @@ func cfConnectDomain(ctx context.Context, domain, path string, timeout float64) 
 	phaseTimeout := attemptTimeout
 	if phaseTimeout > cfproxyDialPhaseTimeout {
 		phaseTimeout = cfproxyDialPhaseTimeout
+	}
+
+	if ws, ip := tryCachedAdaptiveCfDomain(ctx, domain, path, phaseTimeout); ws != nil {
+		return ws, ip, nil
 	}
 
 	hostCtx, cancelHost, hostTimeout := newTimedAttemptContext(ctx, phaseTimeout)
@@ -3163,8 +3437,17 @@ func probeCfRoute(ctx context.Context, dc int, baseDomain string) (string, error
 	}
 
 	domain := fmt.Sprintf("kws%d.%s", dc, baseDomain)
-	ws, _, err := cfConnectDomain(ctx, domain, "/apiws", 5)
+	ws, resolvedIP, err := cfConnectDomain(ctx, domain, "/apiws", 5)
 	if err != nil {
+		adaptiveWS, adaptiveIP, adaptiveErr := scanAdaptiveCfDomain(ctx, domain, "/apiws", resolvedIP)
+		if adaptiveErr == nil {
+			adaptiveWS.Close()
+			noteCfproxyScore(baseDomain, true, nil)
+			clearCfproxy429Cooldown(baseDomain)
+			clearCfproxyFailureCooldown(baseDomain)
+			logInfo.Printf(" CF adaptive route ready %s via %s", domain, adaptiveIP)
+			return baseDomain, nil
+		}
 		noteCfproxyScore(baseDomain, false, err)
 		markCfproxyFailureCooldown(baseDomain)
 		return "", err
@@ -3236,7 +3519,11 @@ func ProbeRoute() *C.char {
 				activeCfDomain = chosen
 				cfproxyMu.Unlock()
 				saveActiveCfproxyDomain(chosen)
-				return C.CString(fmt.Sprintf("ok=1 stage=cf active=%s domains=%d best=%s", chosen, len(domains), bestCfproxyScoreSummary()))
+				adaptiveIP := cachedAdaptiveCfIP(fmt.Sprintf("kws2.%s", chosen))
+				if adaptiveIP == "" {
+					adaptiveIP = "-"
+				}
+				return C.CString(fmt.Sprintf("ok=1 stage=cf active=%s domains=%d adaptive=%s best=%s", chosen, len(domains), adaptiveIP, bestCfproxyScoreSummary()))
 			}
 			if ctx.Err() != nil {
 				break
